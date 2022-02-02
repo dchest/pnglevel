@@ -16,80 +16,159 @@ const (
 	pngHeader   = "\x89PNG\r\n\x1a\n"
 	maxChunkLen = 0x7fffffff
 
-	// We want to write approximate 64K IDAT chunks when level is 0.
-	bufSize = (1 << 16) - 10 /* zlib header + adler checksum */
+	bufSize = 32768 // zlib reads in blocks of 32K
 )
 
-type repacker struct {
+const (
+	stStart = iota
+	stChunkHead
+	stChunkData
+	stChunkCrc
+	stIDAT
+)
+
+type Reader struct {
 	r             io.Reader
-	w             io.Writer
+	w             bytes.Buffer
 	level         int
 	tmp           [13]byte
 	crc           hash.Hash32
-	idatLength    uint32
-	haveLastChunk bool
-	haveIDAT      bool
+	readNonIDAT   bool
+	processedIDAT bool
 	buf           []byte
+	stage         int
+	chunkLen      int
+	chunkType     string
+	zr            io.ReadCloser
+	zw            *zlib.Writer
+	zbuf          bytes.Buffer
+	zcrc          hash.Hash32
+	eof           bool
+}
+
+func Repack(w io.Writer, r io.Reader, level int) error {
+	p := NewReader(r, level)
+	_, err := io.Copy(w, p)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // Repack reads a PNG file from the given io.Reader and
 // writes it recompressed with the given level to io.Writer.
-func Repack(w io.Writer, r io.Reader, level int) error {
-	p := &repacker{
+func NewReader(r io.Reader, level int) io.Reader {
+	return &Reader{
 		r:     r,
-		w:     w,
 		level: level,
-		crc:   crc32.NewIEEE(),
 		buf:   make([]byte, bufSize),
+		crc:   crc32.NewIEEE(),
+		zcrc:  crc32.NewIEEE(),
 	}
-	return p.repack()
 }
 
-func (p *repacker) repack() error {
-	if err := p.header(); err != nil {
-		return err
-	}
-
-	for {
-		length, kind, err := p.chunk()
-		if err != nil {
+func (p *Reader) Read(b []byte) (nn int, err error) {
+	for p.w.Len() == 0 {
+		if p.eof {
+			return 0, io.EOF
+		}
+		if err := p.refill(); err != nil {
 			if err == io.EOF {
+				p.eof = true
+				continue
+			}
+			return 0, err
+		}
+	}
+	n, err := p.w.Read(b[:min(len(b), p.w.Len())])
+	return n, err
+}
+
+func (p *Reader) refill() error {
+	switch p.stage {
+	case stStart:
+		if err := p.verifyHeader(); err != nil {
+			return err
+		}
+		p.stage = stChunkHead
+	case stChunkHead:
+		length, kind, err := p.chunkHeader()
+		if err != nil {
+			return err
+		}
+		if length > maxChunkLen {
+			return errors.New("pnglevel: chunk is too big")
+		}
+		p.chunkLen = length
+		p.chunkType = kind
+		p.stage = stChunkData
+	case stChunkData:
+		if err := p.handleChunkData(); err != nil {
+			return err
+		}
+	case stChunkCrc:
+		if err := p.verifyCrc(); err != nil {
+			return err
+		}
+		p.stage = stChunkHead
+	case stIDAT:
+		if err := p.handleIDAT(); err != nil {
+			p.zr.Close()
+			if err == io.EOF {
+				if !p.readNonIDAT {
+					// Verify checksum of last IDAT chunk without writing it.
+					if _, err := io.ReadFull(p.r, p.tmp[:4]); err != nil {
+						return err
+					}
+					if binary.BigEndian.Uint32(p.tmp[:4]) != p.crc.Sum32() {
+						return fmt.Errorf("pnglevel: invalid checksum of IDAT chunk")
+					}
+					p.stage = stChunkHead
+					return nil
+				}
+				p.stage = stChunkData
 				return nil
 			}
 			return err
 		}
-		if kind == "IDAT" {
-			if p.haveIDAT {
-				return errors.New("pnglevel: wrong IDAT order")
-			}
-			if err := p.handleIDAT(length); err != nil {
-				return err
-			}
-			p.haveIDAT = true
-			// Chunk after IDAT
-			if !p.haveLastChunk {
-				// Verify checksum.
-				if _, err := io.ReadFull(p.r, p.tmp[:4]); err != nil {
-					return err
-				}
-				if binary.BigEndian.Uint32(p.tmp[:4]) != p.crc.Sum32() {
-					return fmt.Errorf("pnglevel: invalid checksum of IDAT chunk")
-				}
-				continue
-			}
-			ulen := binary.BigEndian.Uint32(p.tmp[:4])
-			if ulen > maxChunkLen {
-				return errors.New("pnglevel: chunk is too big")
-			}
-			length = int(ulen)
-		}
-		if err := p.handleAnyChunk(length); err != nil {
-			return err
-		}
+	default:
+		panic("pnglevel: programmer error, unknown stage")
 	}
+	return nil
 }
 
-func (p *repacker) header() error {
+func (p *Reader) handleChunkData() (err error) {
+	if p.chunkType == "IDAT" {
+		if p.processedIDAT {
+			return errors.New("pnglevel: wrong IDAT order")
+		}
+		p.zr, err = zlib.NewReader(&idatReader{r: p})
+		if err != nil {
+			return err
+		}
+		p.zw, err = zlib.NewWriterLevel(&p.zbuf, p.level)
+		if err != nil {
+			return err
+		}
+		p.processedIDAT = true
+		p.stage = stIDAT
+		return nil
+	}
+	// Read and chunk write data.
+	n, err := p.r.Read(p.buf[:min(len(p.buf), p.chunkLen)])
+	if err != nil {
+		return err
+	}
+	p.w.Write(p.buf[:n])
+	p.crc.Write(p.buf[:n])
+	p.chunkLen -= int(n)
+	if p.chunkLen == 0 {
+		p.stage = stChunkCrc
+	}
+	return nil
+}
+
+func (p *Reader) verifyHeader() error {
 	// Verify PNG file signature.
 	if _, err := io.ReadFull(p.r, p.tmp[:8]); err != nil {
 		return err
@@ -102,7 +181,7 @@ func (p *repacker) header() error {
 	}
 
 	// Read IHDR chunk.
-	length, kind, err := p.chunk()
+	length, kind, err := p.chunkHeader()
 	if err != nil {
 		return err
 	}
@@ -111,9 +190,6 @@ func (p *repacker) header() error {
 	}
 	if length != 13 {
 		return errors.New("pnglevel: incorrect IHDR length")
-	}
-	if _, err := p.w.Write(p.tmp[:8]); err != nil {
-		return err
 	}
 	if _, err := io.ReadFull(p.r, p.tmp[:13]); err != nil {
 		return err
@@ -128,14 +204,10 @@ func (p *repacker) header() error {
 	if err := p.verifyCrc(); err != nil {
 		return err
 	}
-	_, err = p.w.Write(p.tmp[:4])
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
-func (p *repacker) chunk() (length int, kind string, err error) {
+func (p *Reader) chunkHeader() (length int, kind string, err error) {
 	if _, err := io.ReadFull(p.r, p.tmp[:8]); err != nil {
 		return 0, "", err
 	}
@@ -145,133 +217,107 @@ func (p *repacker) chunk() (length int, kind string, err error) {
 	}
 	length = int(ulen)
 	kind = string(p.tmp[4:8])
+	if kind != "IDAT" {
+		// Write chunk header.
+		p.w.Write(p.tmp[:8])
+	}
 	p.crc.Reset()
 	p.crc.Write(p.tmp[4:8])
 	return
 }
 
-func (p *repacker) handleAnyChunk(length int) error {
-	// Write what we read in chunk().
-	_, err := p.w.Write(p.tmp[:8])
-	if err != nil {
-		return err
-	}
-	// Copy the chunk.
-	_, err = io.CopyN(io.MultiWriter(p.w, p.crc), p.r, int64(length))
-	if err != nil {
-		return err
-	}
-	// Verify crc.
-	err = p.verifyCrc()
-	if err != nil {
-		return err
-	}
-	// Copy the crc.
-	_, err = p.w.Write(p.tmp[:4])
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (p *repacker) verifyCrc() error {
+func (p *Reader) verifyCrc() error {
 	if _, err := io.ReadFull(p.r, p.tmp[:4]); err != nil {
 		return err
 	}
 	if binary.BigEndian.Uint32(p.tmp[:4]) != p.crc.Sum32() {
 		return errors.New("pnglevel: invalid checksum")
 	}
+	p.w.Write(p.tmp[:4])
+	p.crc.Reset()
 	return nil
 }
 
-func (p *repacker) handleIDAT(length int) error {
-	p.idatLength = uint32(length)
-	var buf bytes.Buffer
-	zr, err := zlib.NewReader(p)
+func (p *Reader) handleIDAT() error {
+	nr, rerr := p.zr.Read(p.buf)
+	if rerr != nil && rerr != io.EOF {
+		return rerr
+	}
+	_, err := p.zw.Write(p.buf[:nr])
 	if err != nil {
 		return err
 	}
-	defer zr.Close()
-	icrc := crc32.NewIEEE()
-	zw, err := zlib.NewWriterLevel(&buf, p.level)
+	err = p.zw.Flush()
 	if err != nil {
 		return err
 	}
-	defer zw.Close()
-	eof := false
-	for !eof {
-		nr, err := zr.Read(p.buf)
-		if err != nil {
-			if err != io.EOF {
-				return err
-			}
-			eof = true
-		}
-		if nr == 0 {
-			continue
-		}
-		_, err = zw.Write(p.buf[:nr])
-		if err != nil {
-			return err
-		}
-		err = zw.Flush()
-		if err != nil {
-			return err
-		}
-		// Write length, chunk name, chunk data, crc.
-		err = binary.Write(p.w, binary.BigEndian, uint32(buf.Len()))
-		if err != nil {
-			return err
-		}
-		_, err = io.WriteString(p.w, "IDAT")
-		if err != nil {
-			return err
-		}
-		_, err = p.w.Write(buf.Bytes())
-		if err != nil {
-			return err
-		}
-		icrc.Write([]byte("IDAT"))
-		icrc.Write(buf.Bytes())
-		err = binary.Write(p.w, binary.BigEndian, icrc.Sum32())
-		if err != nil {
-			return err
-		}
-		icrc.Reset()
-		buf.Reset()
+	if rerr == io.EOF {
+		p.zw.Close()
+	}
+	// Write length, chunk name, chunk data, crc.
+	err = binary.Write(&p.w, binary.BigEndian, uint32(p.zbuf.Len()))
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(&p.w, "IDAT")
+	if err != nil {
+		return err
+	}
+	_, err = p.w.Write(p.zbuf.Bytes())
+	if err != nil {
+		return err
+	}
+	io.WriteString(p.zcrc, "IDAT")
+	p.zcrc.Write(p.zbuf.Bytes())
+	err = binary.Write(&p.w, binary.BigEndian, p.zcrc.Sum32())
+	if err != nil {
+		return err
+	}
+	p.zcrc.Reset()
+	p.zbuf.Reset()
+	if rerr == io.EOF {
+		return io.EOF
 	}
 	return nil
 }
 
-func (p *repacker) Read(b []byte) (nn int, err error) {
-	// Copied mostly from image/png
+type idatReader struct {
+	r *Reader
+}
+
+func (p *idatReader) Read(b []byte) (nn int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	for p.idatLength == 0 {
-		if _, err := io.ReadFull(p.r, p.tmp[:4]); err != nil {
+	for p.r.chunkLen == 0 {
+		if _, err := io.ReadFull(p.r.r, p.r.tmp[:4]); err != nil {
 			return 0, err
 		}
-		if binary.BigEndian.Uint32(p.tmp[:4]) != p.crc.Sum32() {
+		if binary.BigEndian.Uint32(p.r.tmp[:4]) != p.r.crc.Sum32() {
 			return nn, fmt.Errorf("pnglevel: invalid checksum of IDAT chunk")
 		}
-		if _, err := io.ReadFull(p.r, p.tmp[:8]); err != nil {
+		if _, err := io.ReadFull(p.r.r, p.r.tmp[:8]); err != nil {
 			return 0, err
 		}
-		p.idatLength = binary.BigEndian.Uint32(p.tmp[:4])
-		if string(p.tmp[4:8]) != "IDAT" {
-			p.haveLastChunk = true
+		ulen := binary.BigEndian.Uint32(p.r.tmp[:4])
+		if ulen > maxChunkLen {
+			return 0, errors.New("pnglevel: chunk is too big")
+		}
+		p.r.chunkLen = int(ulen)
+		if p.r.chunkLen > maxChunkLen {
+			return 0, errors.New("pnglevel: IDAT chunk is too big")
+		}
+		p.r.chunkType = string(p.r.tmp[4:8])
+		p.r.crc.Reset()
+		p.r.crc.Write(p.r.tmp[4:8])
+		if p.r.chunkType != "IDAT" {
+			p.r.readNonIDAT = true
 			return 0, io.EOF
 		}
-		p.crc.Reset()
-		p.crc.Write(p.tmp[4:8])
 	}
-	if p.idatLength > maxChunkLen {
-		return 0, errors.New("pnglevel: IDAT chunk is too big")
-	}
-	n, err := p.r.Read(b[:min(len(b), int(p.idatLength))])
-	p.crc.Write(b[:n])
-	p.idatLength -= uint32(n)
+	n, err := p.r.r.Read(b[:min(len(b), p.r.chunkLen)])
+	p.r.crc.Write(b[:n])
+	p.r.chunkLen -= n
 	return n, err
 }
 
