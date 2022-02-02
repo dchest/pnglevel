@@ -60,7 +60,7 @@ func (p *repacker) repack() error {
 		}
 		if kind == "IDAT" {
 			if p.haveIDAT {
-				return errors.New("pngzero: wrong IDAT order")
+				return errors.New("pnglevel: wrong IDAT order")
 			}
 			if err := p.handleIDAT(length); err != nil {
 				return err
@@ -73,13 +73,13 @@ func (p *repacker) repack() error {
 					return err
 				}
 				if binary.BigEndian.Uint32(p.tmp[:4]) != p.crc.Sum32() {
-					return fmt.Errorf("pngzero: invalid checksum of IDAT chunk")
+					return fmt.Errorf("pnglevel: invalid checksum of IDAT chunk")
 				}
 				continue
 			}
 			ulen := binary.BigEndian.Uint32(p.tmp[:4])
 			if ulen > maxChunkLen {
-				return errors.New("pngzero: chunk is too big")
+				return errors.New("pnglevel: chunk is too big")
 			}
 			length = int(ulen)
 		}
@@ -95,7 +95,7 @@ func (p *repacker) header() error {
 		return err
 	}
 	if string(p.tmp[:8]) != pngHeader {
-		return errors.New("pngzero: not a PNG file")
+		return errors.New("pnglevel: not a PNG file")
 	}
 	if _, err := p.w.Write(p.tmp[:8]); err != nil {
 		return err
@@ -107,10 +107,10 @@ func (p *repacker) header() error {
 		return err
 	}
 	if kind != "IHDR" {
-		return errors.New("pngzero: missing IHDR")
+		return errors.New("pnglevel: missing IHDR")
 	}
 	if length != 13 {
-		return errors.New("pngzero: incorrect IHDR length")
+		return errors.New("pnglevel: incorrect IHDR length")
 	}
 	if _, err := p.w.Write(p.tmp[:8]); err != nil {
 		return err
@@ -119,7 +119,7 @@ func (p *repacker) header() error {
 		return err
 	}
 	if p.tmp[10] != 0 {
-		return errors.New("pngzero: unsupported compression method")
+		return errors.New("pnglevel: unsupported compression method")
 	}
 	p.crc.Write(p.tmp[:13])
 	if _, err := p.w.Write(p.tmp[:13]); err != nil {
@@ -141,7 +141,7 @@ func (p *repacker) chunk() (length int, kind string, err error) {
 	}
 	ulen := binary.BigEndian.Uint32(p.tmp[:4])
 	if ulen > maxChunkLen {
-		return 0, "", errors.New("pngzero: chunk is too big")
+		return 0, "", errors.New("pnglevel: chunk is too big")
 	}
 	length = int(ulen)
 	kind = string(p.tmp[4:8])
@@ -179,7 +179,7 @@ func (p *repacker) verifyCrc() error {
 		return err
 	}
 	if binary.BigEndian.Uint32(p.tmp[:4]) != p.crc.Sum32() {
-		return errors.New("pngzero: invalid checksum")
+		return errors.New("pnglevel: invalid checksum")
 	}
 	return nil
 }
@@ -253,7 +253,7 @@ func (p *repacker) Read(b []byte) (nn int, err error) {
 			return 0, err
 		}
 		if binary.BigEndian.Uint32(p.tmp[:4]) != p.crc.Sum32() {
-			return nn, fmt.Errorf("pngzero: invalid checksum of IDAT chunk")
+			return nn, fmt.Errorf("pnglevel: invalid checksum of IDAT chunk")
 		}
 		if _, err := io.ReadFull(p.r, p.tmp[:8]); err != nil {
 			return 0, err
@@ -267,7 +267,7 @@ func (p *repacker) Read(b []byte) (nn int, err error) {
 		p.crc.Write(p.tmp[4:8])
 	}
 	if p.idatLength > maxChunkLen {
-		return 0, errors.New("pngzero: IDAT chunk is too big")
+		return 0, errors.New("pnglevel: IDAT chunk is too big")
 	}
 	n, err := p.r.Read(b[:min(len(b), int(p.idatLength))])
 	p.crc.Write(b[:n])
